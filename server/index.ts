@@ -23,53 +23,76 @@ let remoteNode: RemoteExecution | undefined = undefined
 let enginePath: string | undefined = undefined
 let projectPath: string | undefined = undefined
 
-const connectWithRetry = async (maxRetries: number = 3, retryDelay: number = 2000) => {
+const ensureConnected = async (maxRetries: number = 3, retryDelay: number = 1500): Promise<boolean> => {
+	if (remoteNode) return true
 	for (let attempt = 1; attempt <= maxRetries; attempt++) {
 		try {
 			const node = await remoteExecution.getFirstRemoteNode(1000, 5000)
-
-			// Once a node is found, open a command connection
 			await remoteExecution.openCommandConnection(node)
 			remoteNode = remoteExecution
-
-			// Execute a command to verify connection
 			const result = await remoteExecution.runCommand('print("rrmcp:init")')
 			if (!result.success) {
 				throw new Error(`Failed to run command: ${JSON.stringify(result.result)}`)
 			}
-
-			return
+			return true
 		} catch (error) {
 			console.log(`Connection attempt ${attempt} failed:`, error)
-
+			remoteNode = undefined
 			if (attempt < maxRetries) {
-				console.log(`Retrying in ${retryDelay}ms...`)
 				await new Promise((resolve) => setTimeout(resolve, retryDelay))
-				// Exponential backoff
 				retryDelay = Math.min(retryDelay * 1.5, 10000)
-			} else {
-				console.log("Unable to connect to your Unreal Engine Editor after multiple attempts")
-				remoteExecution.stop()
-				process.exit(1)
 			}
 		}
 	}
+	return false
 }
 
-connectWithRetry()
+// Attempt an initial connection, but stay alive on failure so we can reconnect
+// once the editor comes online (no process.exit — the multicast listener keeps running).
+ensureConnected()
 
 const tryRunCommand = async (command: string): Promise<string> => {
 	if (!remoteNode) {
-		throw new Error("Remote node is not available")
+		const ok = await ensureConnected()
+		if (!ok) {
+			throw new Error(
+				"Unreal editor not reachable. In UE: Project Settings > Python > enable 'Enable Remote Execution', then (re)start the editor. The server self-reconnects on the next call, or use the unreal_reconnect tool.",
+			)
+		}
 	}
 
-	const result = await remoteNode.runCommand(command)
-	if (!result.success) {
-		throw new Error(`Command failed with: ${result.result}`)
+	try {
+		const result = await remoteNode!.runCommand(command)
+		if (!result.success) {
+			throw new Error(`Command failed with: ${result.result}`)
+		}
+		return result.output.map((line) => line.output).join("\n")
+	} catch (error) {
+		// Drop the stale handle so the next call transparently reconnects.
+		remoteNode = undefined
+		throw error
 	}
-
-	return result.output.map((line) => line.output).join("\n")
 }
+
+server.tool(
+	"unreal_reconnect",
+	"Reconnect the MCP server to a running Unreal Editor. Use after enabling Remote Execution or restarting the editor.",
+	{},
+	async () => {
+		remoteNode = undefined
+		const ok = await ensureConnected()
+		return {
+			content: [
+				{
+					type: "text",
+					text: ok
+						? "Connected to Unreal Editor."
+						: "Still could not reach the editor. Confirm Project Settings > Python > 'Enable Remote Execution' is on and the editor is running.",
+				},
+			],
+		}
+	},
+)
 
 server.tool(
 	"set_unreal_engine_path",
