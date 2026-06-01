@@ -13,7 +13,12 @@ export const server = new McpServer({
 	version: "0.1.0",
 })
 
-const config = new RemoteExecutionConfig(1, ["239.0.0.1", 6766], "0.0.0.0")
+// Tunable via env to match UE Project Settings > Python > Remote Execution.
+// On multi-NIC machines (Tailscale/Hyper-V), pin both UE bind and UE_MCP_BIND to 127.0.0.1 for deterministic loopback discovery.
+const MCAST_GROUP = process.env.UE_MCP_MCAST || "239.0.0.1"
+const MCAST_PORT = Number(process.env.UE_MCP_PORT || 6766)
+const BIND_ADDR = process.env.UE_MCP_BIND || "0.0.0.0"
+const config = new RemoteExecutionConfig(1, [MCAST_GROUP, MCAST_PORT], BIND_ADDR)
 const remoteExecution = new RemoteExecution(config)
 
 // Start the remote execution server
@@ -61,17 +66,20 @@ const tryRunCommand = async (command: string): Promise<string> => {
 		}
 	}
 
+	let result
 	try {
-		const result = await remoteNode!.runCommand(command)
-		if (!result.success) {
-			throw new Error(`Command failed with: ${result.result}`)
-		}
-		return result.output.map((line) => line.output).join("\n")
+		// Transport-level failure (connection actually dead) -> drop handle so we re-discover next call.
+		result = await remoteNode!.runCommand(command)
 	} catch (error) {
-		// Drop the stale handle so the next call transparently reconnects.
 		remoteNode = undefined
 		throw error
 	}
+	// Python-level failure (e.g. unsupported export, script exception). Connection is FINE —
+	// do NOT drop the handle, or one benign error forces a flaky multicast re-discovery.
+	if (!result.success) {
+		throw new Error(`Command failed with: ${result.result}`)
+	}
+	return result.output.map((line) => line.output).join("\n")
 }
 
 server.tool(
